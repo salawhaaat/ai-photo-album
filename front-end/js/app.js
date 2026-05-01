@@ -60,6 +60,7 @@ function doUpload() {
     data: file,
     processData: false,
     contentType: false,
+    dataType: 'text',   // S3 returns empty body, not JSON — avoid parsererror
     headers,
     success() {
       $('#uploadStatus').html(
@@ -70,9 +71,19 @@ function doUpload() {
       $('#customLabels').val('');
     },
     error(err) {
-      $('#uploadStatus').html(
-        `<span class="text-danger">Upload failed: ${JSON.stringify(err.responseJSON || err.statusText)}</span>`
-      );
+      // 200/204 with empty body still triggers jQuery error — treat as success
+      if (err.status === 200 || err.status === 204) {
+        $('#uploadStatus').html(
+          '<span class="text-success">Uploaded successfully! ' +
+          'Wait ~5 seconds then search for your labels.</span>'
+        );
+        $('#fileInput').val('');
+        $('#customLabels').val('');
+      } else {
+        $('#uploadStatus').html(
+          `<span class="text-danger">Upload failed (${err.status}): ${err.statusText}</span>`
+        );
+      }
     },
   });
 }
