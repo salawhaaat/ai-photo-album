@@ -38,13 +38,17 @@ def lambda_handler(event, context):
         raw  = head.get('Metadata', {}).get('customlabels', '')
         custom_labels = [l.strip().lower() for l in raw.split(',') if l.strip()]
 
-        # 2. Auto-detect labels with Rekognition
-        rek = rekognition.detect_labels(
-            Image={'S3Object': {'Bucket': bucket, 'Name': key}},
-            MaxLabels=15,
-            MinConfidence=70,
-        )
-        rek_labels = [lbl['Name'].lower() for lbl in rek['Labels']]
+        # 2. Auto-detect labels with Rekognition (best-effort — don't fail if image format unsupported)
+        rek_labels = []
+        try:
+            rek = rekognition.detect_labels(
+                Image={'S3Object': {'Bucket': bucket, 'Name': key}},
+                MaxLabels=15,
+                MinConfidence=70,
+            )
+            rek_labels = [lbl['Name'].lower() for lbl in rek['Labels']]
+        except Exception as e:
+            print(f"Rekognition failed for {key}: {e} — indexing with custom labels only")
 
         all_labels = rek_labels + custom_labels
 
