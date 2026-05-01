@@ -1,0 +1,594 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Photo Album Assignment 3 — Full Infrastructure (one-command deploy)
+  Provisions: OpenSearch domain, Lex bot + alias, S3 B1 (frontend), S3 B2 (photos),
+  S3 PUT trigger → LF1, IAM roles, LF1, LF2, API Gateway (GET /search + PUT /photos).
+  CodePipeline is set up separately (not required in template per assignment spec).
+
+# ── No required parameters — everything is auto-wired ────────────────────────
+# Optional overrides only
+Parameters:
+  BucketSuffix:
+    Type: String
+    Default: ''
+    Description: >
+      Optional suffix appended to bucket names to avoid global name collisions.
+      Leave blank to use the AWS account ID as suffix (default).
+
+Conditions:
+  UseAccountIdSuffix: !Equals [!Ref BucketSuffix, '']
+
+Resources:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 1. OpenSearch Domain
+  # ════════════════════════════════════════════════════════════════════════════
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: photos
+      EngineVersion: 'OpenSearch_2.11'
+      ClusterConfig:
+        InstanceType: t3.small.search
+        InstanceCount: 1
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 10
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/photos/*'
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+    DependsOn: LambdaExecutionRole
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 2. Amazon Lex Bot — PhotoSearchBot
+  # ════════════════════════════════════════════════════════════════════════════
+  PhotoSearchBot:
+    Type: AWS::Lex::Bot
+    Properties:
+      Name: PhotoSearchBot
+      RoleArn: !GetAtt LexBotRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300
+      AutoBuildBotLocales: true
+      BotLocales:
+        - LocaleId: en_US
+          NluConfidenceThreshold: 0.40
+          Intents:
+            - Name: SearchIntent
+              SampleUtterances:
+                - Utterance: '{keyword1}'
+                - Utterance: 'show me {keyword1}'
+                - Utterance: 'show me photos of {keyword1}'
+                - Utterance: 'find {keyword1}'
+                - Utterance: 'search for {keyword1}'
+                - Utterance: '{keyword1} and {keyword2}'
+                - Utterance: 'show me {keyword1} and {keyword2}'
+                - Utterance: 'show me photos with {keyword1} and {keyword2}'
+                - Utterance: 'find photos with {keyword1} and {keyword2}'
+              Slots:
+                - Name: keyword1
+                  SlotTypeName: AMAZON.AlphaNumeric
+                  ValueElicitationSetting:
+                    SlotConstraint: Required
+                    PromptSpecification:
+                      MaxRetries: 2
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: 'What would you like to search for?'
+                - Name: keyword2
+                  SlotTypeName: AMAZON.AlphaNumeric
+                  ValueElicitationSetting:
+                    SlotConstraint: Optional
+                    PromptSpecification:
+                      MaxRetries: 1
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: 'Any second keyword?'
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: keyword1
+                - Priority: 2
+                  SlotName: keyword2
+              IntentConfirmationSetting:
+                PromptSpecification:
+                  MaxRetries: 1
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: 'Searching for {keyword1}. Confirm?'
+                DeclinationResponse:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: 'OK, cancelled.'
+              FulfillmentCodeHook:
+                Enabled: false
+            - Name: FallbackIntent
+              ParentIntentSignature: AMAZON.FallbackIntent
+
+  PhotoSearchBotVersion:
+    Type: AWS::Lex::BotVersion
+    Properties:
+      BotId: !Ref PhotoSearchBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_US
+          BotVersionLocaleDetails:
+            SourceBotVersion: DRAFT
+
+  PhotoSearchBotAlias:
+    Type: AWS::Lex::BotAlias
+    Properties:
+      BotId: !Ref PhotoSearchBot
+      BotAliasName: prod
+      BotVersion: !GetAtt PhotoSearchBotVersion.BotVersion
+
+  # IAM role for Lex bot
+  LexBotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lex-photo-search-bot-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lexv2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonPollyFullAccess
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 3. S3 Buckets
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Frontend bucket (B1) — public static website
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - UseAccountIdSuffix
+        - !Sub 'cc-photos-frontend-${AWS::AccountId}'
+        - !Sub 'cc-photos-frontend-${BucketSuffix}'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${FrontendBucket}/*'
+
+  # Photos storage bucket (B2) — triggers LF1 on PUT
+  PhotosBucket:
+    Type: AWS::S3::Bucket
+    # NotificationConfiguration references IndexPhotosFunction, which creates
+    # a circular dependency. We break it by adding the notification after the
+    # Lambda permission is created (see PhotosBucketNotification below).
+    Properties:
+      BucketName: !If
+        - UseAccountIdSuffix
+        - !Sub 'cc-photos-storage-${AWS::AccountId}'
+        - !Sub 'cc-photos-storage-${BucketSuffix}'
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [PUT, GET]
+            AllowedOrigins: ['*']
+            ExposedHeaders: [ETag]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 4. IAM Roles
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Lambda execution role — used by both LF1 and LF2
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-photo-album-role-cfn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonRekognitionReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonOpenSearchServiceFullAccess
+        - arn:aws:iam::aws:policy/AmazonLexRunBotsOnly
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # API Gateway execution role — allows API GW to PUT objects into B2
+  ApiGatewayS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: apigw-s3-proxy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3PutPhotos
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${PhotosBucket}/*'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 5. Lambda Functions
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # LF1: index-photos — triggered by S3 PUT on B2
+  IndexPhotosFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: index-photos
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          OPENSEARCH_HOST: !GetAtt OpenSearchDomain.DomainEndpoint
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              print("Placeholder - real code deployed by CodePipeline")
+              return {'statusCode': 200}
+
+  # Allow S3 to invoke LF1
+  IndexPhotosS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IndexPhotosFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${PhotosBucket}'
+
+  # LF2: search-photos — triggered by API Gateway GET /search
+  SearchPhotosFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: search-photos
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          OPENSEARCH_HOST: !GetAtt OpenSearchDomain.DomainEndpoint
+          LEX_BOT_ID: !Ref PhotoSearchBot
+          LEX_BOT_ALIAS_ID: !GetAtt PhotoSearchBotAlias.BotAliasId
+          PHOTOS_BUCKET: !Ref PhotosBucket
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              print("Placeholder - real code deployed by CodePipeline")
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                  'body': json.dumps({'results': []})
+              }
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 6. S3 Bucket Notification (B2 → LF1)
+  #    Defined as a separate custom resource to break the circular dependency
+  #    between PhotosBucket and IndexPhotosFunction.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Custom resource Lambda that applies the bucket notification
+  BucketNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: setup-bucket-notification
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3, json, urllib.request
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              props = event['ResourceProperties']
+              bucket = props['BucketName']
+              fn_arn = props['LambdaArn']
+
+              if event['RequestType'] == 'Delete':
+                  s3.put_bucket_notification_configuration(
+                      Bucket=bucket,
+                      NotificationConfiguration={}
+                  )
+              else:
+                  s3.put_bucket_notification_configuration(
+                      Bucket=bucket,
+                      NotificationConfiguration={
+                          'LambdaFunctionConfigurations': [{
+                              'LambdaFunctionArn': fn_arn,
+                              'Events': ['s3:ObjectCreated:Put']
+                          }]
+                      }
+                  )
+
+              # Send CloudFormation response
+              resp = {
+                  'Status': 'SUCCESS',
+                  'PhysicalResourceId': bucket,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+              }
+              data = json.dumps(resp).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=data,
+                                           headers={'Content-Type': ''}, method='PUT')
+              urllib.request.urlopen(req)
+
+  PhotosBucketNotification:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: IndexPhotosS3Permission
+    Properties:
+      ServiceToken: !GetAtt BucketNotificationFunction.Arn
+      BucketName: !Ref PhotosBucket
+      LambdaArn: !GetAtt IndexPhotosFunction.Arn
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 7. API Gateway — GET /search (Lambda proxy) + PUT /photos/{filename} (S3 proxy)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  PhotoAlbumApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: photo-album-api
+      Description: AI Photo Album REST API
+      BinaryMediaTypes:
+        - 'image/*'
+        - 'image/jpeg'
+        - 'image/png'
+
+  # ── GET /search ─────────────────────────────────────────────────────────────
+  SearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PhotoAlbumApi
+      ParentId: !GetAtt PhotoAlbumApi.RootResourceId
+      PathPart: search
+
+  SearchGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PhotoAlbumApi
+      ResourceId: !Ref SearchResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.querystring.q: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnArn}/invocations'
+          - FnArn: !GetAtt SearchPhotosFunction.Arn
+
+  SearchOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PhotoAlbumApi
+      ResourceId: !Ref SearchResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,x-amz-meta-customLabels,x-api-key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  SearchLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SearchPhotosFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PhotoAlbumApi}/*/GET/search'
+
+  # ── PUT /photos/{filename} — S3 proxy ───────────────────────────────────────
+  PhotosResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PhotoAlbumApi
+      ParentId: !GetAtt PhotoAlbumApi.RootResourceId
+      PathPart: photos
+
+  PhotosFilenameResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PhotoAlbumApi
+      ParentId: !Ref PhotosResource
+      PathPart: '{filename}'
+
+  PhotosPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PhotoAlbumApi
+      ResourceId: !Ref PhotosFilenameResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.filename: true
+        method.request.header.Content-Type: false
+        method.request.header.x-amz-meta-customLabels: false
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: PUT
+        Credentials: !GetAtt ApiGatewayS3Role.Arn
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:s3:path/${PhotosBucket}/{filename}'
+        RequestParameters:
+          integration.request.path.filename: method.request.path.filename
+          integration.request.header.Content-Type: method.request.header.Content-Type
+          integration.request.header.x-amz-meta-customlabels: method.request.header.x-amz-meta-customLabels
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  PhotosOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PhotoAlbumApi
+      ResourceId: !Ref PhotosFilenameResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,x-amz-meta-customLabels,x-api-key'"
+              method.response.header.Access-Control-Allow-Methods: "'PUT,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ── Deploy API ───────────────────────────────────────────────────────────────
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SearchGetMethod
+      - SearchOptionsMethod
+      - PhotosPutMethod
+      - PhotosOptionsMethod
+    Properties:
+      RestApiId: !Ref PhotoAlbumApi
+      StageName: prod
+
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiDeployment
+    Properties:
+      UsagePlanName: photo-album-usage-plan
+      ApiStages:
+        - ApiId: !Ref PhotoAlbumApi
+          Stage: prod
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiDeployment
+    Properties:
+      Name: photo-album-api-key
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref PhotoAlbumApi
+          StageName: prod
+
+  ApiUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  FrontendURL:
+    Description: Public S3 static website URL for the photo album
+    Value: !GetAtt FrontendBucket.WebsiteURL
+    Export:
+      Name: PhotoAlbumFrontendURL
+
+  ApiEndpoint:
+    Description: API Gateway prod stage base URL
+    Value: !Sub 'https://${PhotoAlbumApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: PhotoAlbumApiEndpoint
+
+  PhotosBucketName:
+    Description: Name of the photos storage bucket (B2)
+    Value: !Ref PhotosBucket
+    Export:
+      Name: PhotoAlbumPhotosBucket
+
+  OpenSearchEndpoint:
+    Description: OpenSearch domain endpoint (hostname only)
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: PhotoAlbumOpenSearchEndpoint
+
+  LexBotId:
+    Description: Lex V2 Bot ID
+    Value: !Ref PhotoSearchBot
+    Export:
+      Name: PhotoAlbumLexBotId
+
+  LexBotAliasId:
+    Description: Lex V2 Bot Alias ID
+    Value: !GetAtt PhotoSearchBotAlias.BotAliasId
+    Export:
+      Name: PhotoAlbumLexBotAliasId

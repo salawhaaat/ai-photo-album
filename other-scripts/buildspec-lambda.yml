@@ -1,0 +1,37 @@
+version: 0.2
+
+# CodePipeline P1 — builds and deploys both Lambda functions
+# CodeBuild role needs: AWSLambda_FullAccess, AmazonS3FullAccess
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+
+  build:
+    commands:
+      # ── index-photos ──
+      - echo "Building index-photos..."
+      - cd lambda-functions/index-photos
+      - pip install -r requirements.txt -t package/ --quiet
+      - cp lambda_function.py package/
+      - cd package && zip -r ../../../index-photos.zip . && cd ../../..
+
+      # ── search-photos ──
+      - echo "Building search-photos..."
+      - cd lambda-functions/search-photos
+      - pip install -r requirements.txt -t package/ --quiet
+      - cp lambda_function.py package/
+      - cd package && zip -r ../../../search-photos.zip . && cd ../../..
+
+  post_build:
+    commands:
+      - echo "Deploying index-photos..."
+      - aws lambda update-function-code --function-name index-photos --zip-file fileb://index-photos.zip
+      - echo "Deploying search-photos..."
+      - aws lambda update-function-code --function-name search-photos --zip-file fileb://search-photos.zip
+      - echo "Done."
+
+artifacts:
+  files:
+    - '**/*'

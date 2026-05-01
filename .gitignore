@@ -1,0 +1,15 @@
+# Lambda build artifacts
+lambda-functions/*/package/
+lambda-functions/*/build_index/
+lambda-functions/*/build_search/
+lambda-functions/**/*.zip
+*.zip
+
+# Test files
+test-dog.jpg
+
+# Kiro IDE
+.kiro/
+
+# macOS
+.DS_Store
