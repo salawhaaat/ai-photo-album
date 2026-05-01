@@ -152,3 +152,4 @@ Buildspec for P1: `other-scripts/buildspec-lambda.yml`
 - **Backend:** Python 3.12 Lambda, `opensearch-py==2.4.2`, `requests-aws4auth==1.3.1`
 - **AWS Services:** S3, Lambda, API Gateway, Rekognition, Lex V2, OpenSearch, CodePipeline, CodeBuild, CloudFormation, IAM
  
+
