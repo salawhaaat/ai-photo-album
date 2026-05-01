@@ -29,7 +29,9 @@ def get_os_client():
 def lambda_handler(event, context):
     for record in event['Records']:
         bucket = record['s3']['bucket']['name']
-        key    = record['s3']['object']['key']
+        # S3 event keys are URL-encoded — decode spaces and special chars
+        from urllib.parse import unquote_plus
+        key = unquote_plus(record['s3']['object']['key'])
 
         # 1. Read custom labels from S3 metadata (set via x-amz-meta-customlabels header)
         head = s3.head_object(Bucket=bucket, Key=key)
