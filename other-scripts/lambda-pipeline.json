@@ -1,0 +1,53 @@
+{
+  "pipeline": {
+    "name": "lambda-pipeline",
+    "roleArn": "arn:aws:iam::327796149266:role/codepipeline-photo-album-role",
+    "artifactStore": {
+      "type": "S3",
+      "location": "codepipeline-artifacts-327796149266"
+    },
+    "stages": [
+      {
+        "name": "Source",
+        "actions": [
+          {
+            "name": "Source",
+            "actionTypeId": {
+              "category": "Source",
+              "owner": "AWS",
+              "provider": "CodeStarSourceConnection",
+              "version": "1"
+            },
+            "configuration": {
+              "ConnectionArn": "arn:aws:codeconnections:us-east-1:327796149266:connection/7fb2844a-74d9-453e-860c-efd1e5dcaf98",
+              "FullRepositoryId": "salawhaaat/ai-photo-album",
+              "BranchName": "main",
+              "OutputArtifactFormat": "CODE_ZIP"
+            },
+            "outputArtifacts": [{"name": "SourceOutput"}],
+            "runOrder": 1
+          }
+        ]
+      },
+      {
+        "name": "Build",
+        "actions": [
+          {
+            "name": "BuildAndDeploy",
+            "actionTypeId": {
+              "category": "Build",
+              "owner": "AWS",
+              "provider": "CodeBuild",
+              "version": "1"
+            },
+            "configuration": {
+              "ProjectName": "lambda-build"
+            },
+            "inputArtifacts": [{"name": "SourceOutput"}],
+            "runOrder": 1
+          }
+        ]
+      }
+    ]
+  }
+}
